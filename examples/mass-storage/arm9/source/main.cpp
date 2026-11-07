@@ -1,6 +1,6 @@
 #include "common.h"
 #include <nds/arm9/video.h>
-#include <nds/system.h>
+
 #include <libtwl/gfx/gfx.h>
 #include <libtwl/gfx/gfxStatus.h>
 #include <libtwl/ipc/ipcFifoSystem.h>
@@ -23,7 +23,7 @@ static void vblankIrq(u32 irqMask)
 /// @brief Puts a 16 bpp framebuffer on each screen, read straight from VRAM.
 static void initializeDisplay()
 {
-    powerOn(POWER_ALL_2D);
+    // Not every libnds build exports powerOn(), and the LCDs are already on after boot.
 
     videoSetMode(MODE_FB0);
     videoSetModeSub(MODE_FB2);
