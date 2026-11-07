@@ -48,3 +48,5 @@ Thumbs.db
 *.a
 .vscode/
 # Mount microSD build artifacts
+
+# Mount microSD (fork CI build)
