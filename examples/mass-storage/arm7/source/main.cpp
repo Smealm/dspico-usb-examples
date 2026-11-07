@@ -20,6 +20,7 @@
 #include "Arm7State.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+#include "usbStatusMessages.h"
 
 static DldiIpcService sDldiIpcService;
 
@@ -32,6 +33,15 @@ static volatile u8 sMcuIrqFlag = false;
 
 static u32 sSdBlockCount;
 static u8 sSector0Buffer[512] alignas(4);
+
+// Host-visible state. The arm9 UI mirrors all of it over IPC.
+static volatile bool sWriteProtected = false;
+static volatile bool sMediaPresent = true;
+static volatile u32 sHostReadBytes = 0;
+static volatile u32 sHostWriteBytes = 0;
+static u32 sLastReportedReadBytes = 0;
+static u32 sLastReportedWriteBytes = 0;
+static u32 sTrafficReportFrame = 0;
 
 static rtos_thread_t sUsbThread;
 static u32 sUsbThreadStack[512];
@@ -72,6 +82,25 @@ static void checkMcuIrq(void)
                 sState = Arm7State::ExitRequested;
             }
         }
+    }
+}
+
+static void notifyArm9(UsbStatusEvent event)
+{
+    ipc_sendFifoMessage(IPC_CHANNEL_USB_STATUS, (u32)event);
+}
+
+static void usbControlHandler(u32 channel, u32 data, void* arg)
+{
+    (void)channel;
+    (void)arg;
+    switch (USB_CONTROL_GET_COMMAND(data))
+    {
+        case USB_CONTROL_SET_WRITE_PROTECT:
+            sWriteProtected = USB_CONTROL_GET_ARGUMENT(data) != 0;
+            break;
+        default:
+            break;
     }
 }
 
@@ -139,6 +168,7 @@ static void initializeArm7()
     rtos_initIrq();
     rtos_startMainThread();
     ipc_initFifoSystem();
+    ipc_setChannelHandler(IPC_CHANNEL_USB_CONTROL, usbControlHandler, nullptr);
 
     rtos_createMutex(&gCardMutex);
 
@@ -189,6 +219,27 @@ static void initializeArm7()
     rtos_wakeupThread(&sUsbThread);
 }
 
+static void reportTraffic()
+{
+    if (++sTrafficReportFrame < 10)
+        return;
+    sTrafficReportFrame = 0;
+
+    u32 readBytes = sHostReadBytes;
+    if (readBytes != sLastReportedReadBytes)
+    {
+        ipc_sendFifoMessage(IPC_CHANNEL_USB_TRAFFIC_READ, readBytes - sLastReportedReadBytes);
+        sLastReportedReadBytes = readBytes;
+    }
+
+    u32 writeBytes = sHostWriteBytes;
+    if (writeBytes != sLastReportedWriteBytes)
+    {
+        ipc_sendFifoMessage(IPC_CHANNEL_USB_TRAFFIC_WRITE, writeBytes - sLastReportedWriteBytes);
+        sLastReportedWriteBytes = writeBytes;
+    }
+}
+
 static void updateArm7IdleState()
 {
     checkMcuIrq();
@@ -226,6 +277,8 @@ static void updateArm7ExitRequestedState()
 
 static void updateArm7()
 {
+    reportTraffic();
+
     switch (sState)
     {
         case Arm7State::Idle:
@@ -262,7 +315,7 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
     (void) lun;
 
     const char vid[] = "DSpico";
-    const char pid[] = "Mass Storage";
+    const char pid[] = "microSD Card";
     const char rev[] = "1.0";
 
     memcpy(vendor_id  , vid, strlen(vid));
@@ -275,7 +328,8 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
     (void) lun;
-    return true;
+    // An ejected medium stays absent until the host loads it again.
+    return sMediaPresent;
 }
 
 // Invoked when received SCSI_CMD_READ_CAPACITY_10 and SCSI_CMD_READ_FORMAT_CAPACITY to determine the disk size
@@ -284,7 +338,7 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_siz
 {
     (void) lun;
 
-    *block_count = sSdBlockCount;
+    *block_count = sMediaPresent ? sSdBlockCount : 0;
     *block_size  = 512;
 }
 
@@ -295,6 +349,12 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 {
     (void) lun;
     (void) power_condition;
+
+    if (load_eject && sMediaPresent != start)
+    {
+        sMediaPresent = start;
+        notifyArm9(start ? USB_STATUS_MEDIA_LOADED : USB_STATUS_MEDIA_EJECTED);
+    }
     return true;
 }
 
@@ -303,6 +363,11 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize)
 {
     (void) lun;
+
+    if (!sMediaPresent)
+    {
+        return -1;
+    }
 
     if (offset != 0 || (bufsize % 512) != 0)
     {
@@ -313,13 +378,16 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
     _DLDI_readSectors_ptr(lba, bufsize / 512, buffer);
     rtos_unlockMutex(&gCardMutex);
 
+    sHostReadBytes += bufsize;
     return (int32_t)bufsize;
 }
 
 bool tud_msc_is_writable_cb(uint8_t lun)
 {
     (void) lun;
-    return true;
+    // Writing to the card while the launcher (or the user) wants it untouched
+    // fails at the SCSI layer, so the PC reports a write-protected disk.
+    return !sWriteProtected;
 }
 
 // Callback invoked when received WRITE10 command.
@@ -327,6 +395,17 @@ bool tud_msc_is_writable_cb(uint8_t lun)
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize)
 {
     (void) lun;
+
+    if (!sMediaPresent)
+    {
+        return -1;
+    }
+
+    if (sWriteProtected)
+    {
+        tud_msc_set_sense(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);
+        return -1;
+    }
 
     if (offset != 0 || (bufsize % 512) != 0)
     {
@@ -337,7 +416,31 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
     _DLDI_writeSectors_ptr(lba, bufsize / 512, buffer);
     rtos_unlockMutex(&gCardMutex);
 
+    sHostWriteBytes += bufsize;
     return (int32_t)bufsize;
+}
+
+// Invoked when the host mounts or unmounts the drive
+void tud_mount_cb(void)
+{
+    sMediaPresent = true;
+    notifyArm9(USB_STATUS_MOUNTED);
+}
+
+void tud_umount_cb(void)
+{
+    notifyArm9(USB_STATUS_UNMOUNTED);
+}
+
+void tud_suspend_cb(bool remote_wakeup_en)
+{
+    (void) remote_wakeup_en;
+    notifyArm9(USB_STATUS_SUSPENDED);
+}
+
+void tud_resume_cb(void)
+{
+    notifyArm9(USB_STATUS_RESUMED);
 }
 
 // Callback invoked when received an SCSI command not in built-in list below

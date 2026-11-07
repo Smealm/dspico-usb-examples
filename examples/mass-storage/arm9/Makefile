@@ -16,7 +16,10 @@ include $(DEVKITARM)/ds_rules
 #---------------------------------------------------------------------------------
 BUILD		:=	build
 SOURCES		:=	source \
-				source/core
+				source/core \
+				source/card \
+				source/ui \
+				source/usb
 INCLUDES	:=	include source ../common
 DATA		:=  data
 GRAPHICS 	:=  gfx

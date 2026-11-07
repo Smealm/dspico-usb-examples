@@ -13,8 +13,8 @@ export TOPDIR	:=	$(CURDIR)
 NITRO_FILES	:=
 
 # These set the information text in the nds file
-GAME_TITLE     := USB Mass Storage Example
-GAME_SUBTITLE1 := DSpico
+GAME_TITLE     := Mount microSD
+GAME_SUBTITLE1 := DSpico USB
 GAME_SUBTITLE2 := LNH team
 GAME_ICON	   := icon.bmp
 
